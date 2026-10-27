@@ -422,14 +422,6 @@ requirements.txt     Runtime-only dependency export
 - Add streaming responses with server-sent events and time-to-first-token metrics.
 - Add user feedback capture and query analytics.
 
-## Limitations
-
-- Retrieval quality and answer correctness have not yet been benchmarked.
-- SQLite and Chroma are configured for a single-node deployment.
-- There is no authentication or rate limiting yet.
-- LLM calls are synchronous; responses are not streamed.
-- The evaluation corpus and benchmark harness are planned, not yet included.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
