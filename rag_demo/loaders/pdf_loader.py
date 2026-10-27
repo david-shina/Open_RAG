@@ -1,17 +1,19 @@
-import re
-import fitz
 import logging
 import os
+import re
+from typing import Generator, List
+
+import fitz
+import pdf2image
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_unstructured import UnstructuredLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from unstructured.partition.utils.constants import PartitionStrategy
 from langchain_core.documents import Document
-from . import base_loader 
-import pdf2image
-from typing import List, Generator
-from concurrent.futures import ThreadPoolExecutor
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_unstructured import UnstructuredLoader
+from unstructured.partition.utils.constants import PartitionStrategy
+
+from . import base_loader
+
 #from django.conf import settings
 
 
@@ -19,10 +21,11 @@ from concurrent.futures import ThreadPoolExecutor
 load_dotenv(dotenv_path='.env')
 langchainApiKey = os.getenv('LANGCHAIN_API_KEY')
 
-os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-os.environ['LANGCHAIN_PROJECT'] = 'default'
-os.environ['LANGCHAIN_API_KEY'] = langchainApiKey
-os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+if langchainApiKey:
+    os.environ['LANGCHAIN_TRACING_V2'] = 'true'
+    os.environ['LANGCHAIN_PROJECT'] = 'default'
+    os.environ['LANGCHAIN_API_KEY'] = langchainApiKey
+    os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -200,9 +203,11 @@ class PDFLoader(base_loader.BaseLoader):
 
         for i, chunk in enumerate(docs_chunks):
             chunk.metadata.update({
+                "source": os.path.basename(self.file_path),
                 "doc_id": os.path.basename(self.file_path),
                 "chunk_index": i,
-                "source_type": doc_type
+                "source_type": doc_type,
+                "file_type": "pdf",
             })
 
         logger.info(f"Loaded {len(docs_chunks)} chunks from {self.file_path}")

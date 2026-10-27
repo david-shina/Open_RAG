@@ -1,0 +1,147 @@
+{
+  "timestamp": "2026-10-27T22:54:09.235693+00:00",
+  "git_sha": "8c16a52735298a9863850474f28534885ac9d52e",
+  "python": "3.13.3",
+  "model": "openai/gpt-oss-120b",
+  "translator_model": "openai/gpt-oss-20b",
+  "temperature": 0,
+  "request_timeout_seconds": 60.0,
+  "cases": [
+    {
+      "name": "translation",
+      "passed": true,
+      "latency_ms": 1605.17,
+      "usage": {
+        "prompt_tokens": 442,
+        "completion_tokens": 322,
+        "total_tokens": 764,
+        "calls": 2,
+        "estimated_cost_usd": 0.0
+      },
+      "details": {
+        "variants": [
+          "Which city serves as the capital of France?",
+          "What city is the capital of France?",
+          "Name the capital city of France.",
+          "What is a notable city in France?"
+        ]
+      },
+      "error": null
+    },
+    {
+      "name": "grading",
+      "passed": true,
+      "latency_ms": 1581.11,
+      "usage": {
+        "prompt_tokens": 470,
+        "completion_tokens": 143,
+        "total_tokens": 613,
+        "calls": 2,
+        "estimated_cost_usd": 0.0
+      },
+      "details": {
+        "kept_sources": [
+          "france.md"
+        ],
+        "web_search_used": false
+      },
+      "error": null
+    },
+    {
+      "name": "generation",
+      "passed": true,
+      "latency_ms": 482.47,
+      "usage": {
+        "prompt_tokens": 224,
+        "completion_tokens": 48,
+        "total_tokens": 272,
+        "calls": 1,
+        "estimated_cost_usd": 0.0
+      },
+      "details": {
+        "answer_preview": "Paris is the capital of France[S1].",
+        "citation_ids": [
+          "S1"
+        ],
+        "model_usage": {
+          "prompt_tokens": 224,
+          "completion_tokens": 48,
+          "total_tokens": 272,
+          "estimated_cost_usd": 0.0
+        },
+        "timings_ms": {
+          "generate": 482.4
+        }
+      },
+      "error": null
+    },
+    {
+      "name": "fast_graph",
+      "passed": true,
+      "latency_ms": 528.35,
+      "usage": {
+        "prompt_tokens": 213,
+        "completion_tokens": 63,
+        "total_tokens": 276,
+        "calls": 1,
+        "estimated_cost_usd": 0.0
+      },
+      "details": {
+        "answer_preview": "Paris is the capital of France[S1].",
+        "citation_ids": [
+          "S1"
+        ],
+        "model_usage": {
+          "prompt_tokens": 213,
+          "completion_tokens": 63,
+          "total_tokens": 276,
+          "estimated_cost_usd": 0.0
+        },
+        "timings_ms": {
+          "retrieve": 0.02,
+          "grade_documents": 0.02,
+          "generate": 524.56
+        }
+      },
+      "error": null
+    },
+    {
+      "name": "balanced_graph",
+      "passed": true,
+      "latency_ms": 2495.11,
+      "usage": {
+        "prompt_tokens": 848,
+        "completion_tokens": 348,
+        "total_tokens": 1196,
+        "calls": 4,
+        "estimated_cost_usd": 0.0
+      },
+      "details": {
+        "answer_preview": "Paris is the capital of France[S1].",
+        "citation_ids": [
+          "S1"
+        ],
+        "model_usage": {
+          "prompt_tokens": 213,
+          "completion_tokens": 63,
+          "total_tokens": 276,
+          "estimated_cost_usd": 0.0
+        },
+        "timings_ms": {
+          "retrieve": 1170.92,
+          "grade_documents": 1061.32,
+          "generate": 259.21
+        }
+      },
+      "error": null
+    }
+  ],
+  "summary": {
+    "total": 5,
+    "passed": 5,
+    "failed": 0,
+    "total_calls": 10,
+    "total_tokens": 3121,
+    "p50_latency_ms": 1581.11
+  }
+}

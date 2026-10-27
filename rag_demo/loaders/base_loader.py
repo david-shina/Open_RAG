@@ -1,6 +1,8 @@
 import os
-from abc import abstractmethod, ABC
+from abc import ABC, abstractmethod
+
 from langchain_core.documents import Document
+
 
 class BaseLoader(ABC):
     """

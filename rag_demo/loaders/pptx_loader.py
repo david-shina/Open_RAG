@@ -1,15 +1,16 @@
+import logging
 import os
 import re
-import logging
-from langchain_core.documents import Document
+from typing import Generator, List
+
+from dotenv import load_dotenv
 from langchain_community.document_loaders import UnstructuredPowerPointLoader
+from langchain_core.documents import Document
+from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
 from langchain_unstructured import UnstructuredLoader
 from unstructured.partition.utils.constants import PartitionStrategy
-from . import base_loader
-from dotenv import load_dotenv
-from typing import Generator, List
-from langchain_text_splitters import RecursiveCharacterTextSplitter, CharacterTextSplitter
 
+from . import base_loader
 
 load_dotenv('.env')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,17 +19,18 @@ logger = logging.getLogger(__name__)
 load_dotenv(dotenv_path='.env')
 langchainApiKey = os.getenv('LANGCHAIN_API_KEY')
 
-os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-os.environ['LANGCHAIN_PROJECT'] = 'default'
-os.environ['LANGCHAIN_API_KEY'] = langchainApiKey
-os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+if langchainApiKey:
+    os.environ['LANGCHAIN_TRACING_V2'] = 'true'
+    os.environ['LANGCHAIN_PROJECT'] = 'default'
+    os.environ['LANGCHAIN_API_KEY'] = langchainApiKey
+    os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 
 
 class PptxLoader(base_loader.BaseLoader):
 
     def __init__(self, file_path:str, chunk_size:int = 300, chunk_overlap:int = 50):
         super().__init__(file_path)
-        self.chunk_size = 500
+        self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.start_patterns  = [
             re.compile(pattern) for pattern in [
@@ -95,7 +97,7 @@ class PptxLoader(base_loader.BaseLoader):
         docs = list(self._extract_text())
 
         if not docs: 
-            logger.warning(f'File is empty or extraction of text failed successfully')
+            logger.warning('File is empty or extraction of text failed successfully')
             return []
         
         try:
@@ -115,10 +117,11 @@ class PptxLoader(base_loader.BaseLoader):
         for i, chunk in enumerate(chunks):
             chunk.metadata.update(
                 {
+                    'source':str(os.path.basename(self.file_path)),
                     'sourceId':str(os.path.basename(self.file_path)),
                     'chunk_index':i,
                     'source_type':'Text-based',
-                    'file_type':'docx',
+                    'file_type':'pptx',
                     'language':'en'
                 })
             

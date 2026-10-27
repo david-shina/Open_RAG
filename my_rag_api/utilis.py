@@ -1,143 +1,434 @@
 import logging
-from langchain_groq import ChatGroq
-from typing import List
-from langchain_core.documents import Document
-from langgraph.graph import START, StateGraph, END
-from rag_demo.loaders import pdf_loader, pptx_loader, docxloader, base_loader
-from rag_demo.embeddings import Embedding
-from rag_demo.prompts import *
-from rag_demo.queryTranslator import QueryTranslator
-from pathlib import Path
-from langsmith import Client
-from langchain_core.output_parsers import StrOutputParser
-from tavily import TavilyClient
-from dotenv import load_dotenv
 import os
-from pprint import pprint
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from pathlib import Path
+from typing import Annotated, Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableConfig
+from langchain_groq import ChatGroq
+from langgraph.graph import END, START, StateGraph
+from tavily import TavilyClient
 from typing_extensions import TypedDict
 
+from rag_demo.embeddings import Embedding
+from rag_demo.loaders import docxloader, pdf_loader, pptx_loader
+from rag_demo.prompts import GradeDocument, gradingPrompt, rag_prompt, re_write_prompt
+from rag_demo.queryTranslator import QueryTranslator
 
 load_dotenv()
-langchainApiKey = os.getenv('LANGCHAIN_API_KEY')
-groqApiKey = os.getenv('GROQ_API_KEY')
-braveApiKey = os.getenv('BRAVE_API_KEY')
-tavilyApiKey = os.getenv('TAVILY_API_KEY')
 
-os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-os.environ['LANGCHAIN_PROJECT'] = 'default'
-os.environ['LANGCHAIN_API_KEY'] = langchainApiKey
-os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
-os.environ['GROQ_API_KEY']= groqApiKey
-os.environ['TAVILY_API_KEY'] = tavilyApiKey
-client = Client()
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-llm = ChatGroq(model='llama-3.3-70b-versatile', temperature=0.7)
-structured_llm_output = llm.with_structured_output(GradeDocument)
-qt = QueryTranslator(llm=llm)
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+DEFAULT_TRANSLATOR_MODEL = "openai/gpt-oss-20b"
 
 
-##########################PROMPTS###################################
-rag_prompt = client.pull_prompt('rlm/rag-prompt')
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
-def format_docs(docs):
-    return '\n\n'.join(doc.page_content for doc in docs)
 
-rag_chain = rag_prompt | llm | StrOutputParser()
+PROFILE_DEFAULTS = {
+    "fast": {
+        "translation_mode": "none",
+        "grading_mode": "none",
+        "max_grade_docs": 0,
+        "top_k": 5,
+        "enable_web_search": False,
+    },
+    "balanced": {
+        "translation_mode": "multiquery",
+        "grading_mode": "llm",
+        "max_grade_docs": 8,
+        "top_k": 5,
+        "enable_web_search": True,
+    },
+    "quality": {
+        "translation_mode": "hybrid",
+        "grading_mode": "llm",
+        "max_grade_docs": 8,
+        "top_k": 8,
+        "enable_web_search": True,
+    },
+}
 
-grader_chain = gradingPrompt | structured_llm_output
 
-web_search_tool = TavilyClient()
+@dataclass(frozen=True)
+class RAGConfig:
+    profile: str = "balanced"
+    top_k: int = 5
+    translation_mode: str = "multiquery"
+    grading_mode: str = "llm"
+    max_grade_docs: int = 8
+    enable_web_search: bool = True
+    parallel_retrieval: bool = True
+    max_workers: int = 4
+    llm_model: str = DEFAULT_MODEL
+    translator_model: str = DEFAULT_TRANSLATOR_MODEL
+    temperature: float = 0.0
+    request_timeout: float = 30.0
+    n_query_variants: int = 3
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
 
-question_rewriter = re_write_prompt | llm | StrOutputParser()
+    @classmethod
+    def from_env(cls, profile: Optional[str] = None) -> "RAGConfig": # This is a factory method that creates a RAGConfig instance based on environment variables and optional profile input.
+        requested = (profile or os.getenv("RAG_PROFILE", "balanced")).strip().lower()
+        profile_name = requested if requested in PROFILE_DEFAULTS else "balanced"
+        defaults = PROFILE_DEFAULTS[profile_name]
+        translation_mode = os.getenv(
+            "RAG_TRANSLATION_MODE", defaults["translation_mode"]
+        ).strip().lower()
+        if translation_mode not in {"none", "multiquery", "stepback", "hybrid"}:
+            translation_mode = "multiquery"
+        grading_mode = os.getenv("RAG_GRADING_MODE", defaults["grading_mode"]).strip().lower()
+        if grading_mode not in {"none", "llm"}:
+            grading_mode = "llm"
 
-##Loading of Documents##
-def loadingDocument(filePath):
+        return cls(
+            profile=profile_name,
+            top_k=int(os.getenv("RAG_TOP_K", defaults["top_k"])),
+            translation_mode=translation_mode,
+            grading_mode=grading_mode,
+            max_grade_docs=int(os.getenv("RAG_MAX_GRADE_DOCS", defaults["max_grade_docs"])),
+            enable_web_search=_env_bool("RAG_WEB_SEARCH", defaults["enable_web_search"]),
+            parallel_retrieval=_env_bool("RAG_PARALLEL_RETRIEVAL", True),
+            max_workers=int(os.getenv("RAG_MAX_WORKERS", "4")),
+            llm_model=os.getenv("GROQ_MODEL", DEFAULT_MODEL),
+            translator_model=os.getenv("GROQ_TRANSLATOR_MODEL", DEFAULT_TRANSLATOR_MODEL),
+            temperature=float(os.getenv("GROQ_TEMPERATURE", "0")),
+            request_timeout=float(os.getenv("RAG_REQUEST_TIMEOUT", "30")),
+            n_query_variants=int(os.getenv("N_QUERY_VARIANTS", "3")),
+            input_cost_per_million=float(os.getenv("GROQ_INPUT_COST_PER_1M", "0")),
+            output_cost_per_million=float(os.getenv("GROQ_OUTPUT_COST_PER_1M", "0")),
+        )
+
+
+def _configure_langsmith() -> None:
+    key = os.getenv("LANGCHAIN_API_KEY")
+    if not key:
+        return
+    os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+    os.environ.setdefault("LANGCHAIN_PROJECT", os.getenv("LANGCHAIN_PROJECT", "open-rag"))
+    os.environ.setdefault("LANGCHAIN_API_KEY", key)
+    os.environ.setdefault("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+
+
+_configure_langsmith()
+
+
+@lru_cache(maxsize=16)
+def _chat_model(model: str, temperature: float, timeout: float) -> ChatGroq:
+    return ChatGroq(model=model, temperature=temperature, timeout=timeout)
+
+
+def _llm(config: RAGConfig) -> ChatGroq:
+    return _chat_model(config.llm_model, config.temperature, config.request_timeout)
+
+
+def _translator_llm(config: RAGConfig) -> ChatGroq:
+    return _chat_model(config.translator_model, 0.7, config.request_timeout)
+
+
+@lru_cache(maxsize=8)
+def _grader_chain(model: str, temperature: float, timeout: float):
+    structured = _chat_model(model, temperature, timeout).with_structured_output(GradeDocument)
+    return gradingPrompt | structured
+
+
+@lru_cache(maxsize=8)
+def _rewriter_chain(model: str, temperature: float, timeout: float):
+    return re_write_prompt | _chat_model(model, temperature, timeout) | StrOutputParser()
+
+
+@lru_cache(maxsize=8)
+def _query_translator(model: str, n_variants: int, timeout: float) -> QueryTranslator:
+    return QueryTranslator(
+        llm=_chat_model(model, 0.7, timeout),
+        n_variants=n_variants,
+    )
+
+
+@lru_cache(maxsize=1)
+def _web_search_tool():
+    key = os.getenv("TAVILY_API_KEY")
+    if not key:
+        return None
+    return TavilyClient(api_key=key)
+
+
+def _get_config(config: Optional[RunnableConfig]) -> RAGConfig:
+    configured = (config or {}).get("configurable", {}).get("rag_config")
+    if isinstance(configured, RAGConfig):
+        return configured
+    return RAGConfig.from_env()
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 2)
+
+
+def loadingDocument(filePath: str) -> List[Document]:
+    extension = Path(filePath).suffix.lower()
+
     try:
-        extension = Path(filePath).suffix.lower()
-
-        if extension == '.pdf':
+        if extension == ".pdf":
             chunks = pdf_loader.PDFLoader(filePath).load()
-
-        elif extension == '.docx':
+        elif extension == ".docx":
             chunks = docxloader.DocxLoader(filePath).load()
-        
-        elif extension == '.pptx':
+        elif extension == ".pptx":
             chunks = pptx_loader.PptxLoader(filePath).load()
-
         else:
-            print(f'Invalid file type: {extension}')
+            raise ValueError(
+                f"Unsupported file type: {extension}. Supported types: .pdf, .docx, .pptx"
+            )
 
         if not chunks:
-            raise ValueError(f'No content could be loaded from file: {filePath}')
+            raise ValueError(f"No text could be extracted from file: {filePath}")
 
         return chunks
     except ValueError:
-        raise f'Unsupported file type: {extension}. Supported types: .pdf, .docx, .pptx'
-
-    except Exception as e:
-        raise ValueError(f'Error loading file {filePath}: {str(e)}')
-    
+        raise
+    except Exception as error:
+        raise ValueError(f"Error loading file {filePath}: {error}") from error
 
 
+def embedding(
+    filePath: str,
+    chunks: List[Document],
+    *,
+    user_id: str = "1",
+    document_id: Optional[str] = None,
+    knn: int = 5,
+):
+    result = Embedding(filePath, chunks).create_or_load_vectorstore(
+        userId=user_id,
+        documentId=document_id,
+        knn=knn,
+    )
+    return result["retriever"]
 
-def embedding(filePath, chunks):
-    retreiver, _ = Embedding(filePath, chunks).create_or_load_vectorstore(userId='1')
 
-    return retreiver
-
-def queryTranslator(query:str):
-    return qt.translate(query, mode='hybrid')
-
-
-
-
-class State(TypedDict):
+class State(TypedDict, total=False):
     question: str
-    filePath: str
-    web_search: bool = False
+    original_question: str
+    generated_queries: List[str]
+    web_search_enabled: bool
+    web_search_used: bool
+    query_rewritten: bool
+    retrieved_documents: List[Document]
     documents: List[Document]
     generation: str
+    sources: List[Dict[str, Any]]
+    citations: List[Dict[str, Any]]
+    timings: Annotated[Dict[str, float], lambda left, right: {**(left or {}), **(right or {})}]
+    usage: Annotated[Dict[str, Any], lambda left, right: {**(left or {}), **(right or {})}]
 
-_vector_store_cache = {}
-def retrieve(state: State, config):
-    
-    question = state['question']
-    # Try getting it from config (works for local 'chat' function)
-    retriever = config.get('configurable', {}).get('retriever')
-    
-    # Fallback logic if running in Studio (where config retriever is None)
+
+def _normalize(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _deduplicate_documents(documents: List[Document]) -> List[Document]:
+    seen = set()
+    unique: List[Document] = []
+    for document in documents:
+        key = _normalize(document.page_content)[:500]
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(document)
+    return unique
+
+
+def _assign_citation_ids(documents: List[Document]) -> List[Document]:
+    for index, document in enumerate(documents, start=1):
+        document.metadata = dict(document.metadata or {})
+        document.metadata["citation_id"] = f"S{index}"
+    return documents
+
+
+def _document_source(document: Document) -> Dict[str, Any]:
+    metadata = document.metadata or {}
+    source = (
+        metadata.get("source")
+        or metadata.get("sourceId")
+        or metadata.get("url")
+        or metadata.get("file_type")
+        or "unknown"
+    )
+    return {
+        "citation_id": metadata.get("citation_id"),
+        "source": source,
+        "page": metadata.get("page"),
+        "chunk_index": metadata.get("chunk_index"),
+        "url": metadata.get("url"),
+        "snippet": document.page_content[:200],
+    }
+
+
+def _extract_sources(documents: List[Document]) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    seen = set()
+    for document in documents:
+        source = _document_source(document)
+        key = (
+            str(source["source"]),
+            source["page"],
+            source["chunk_index"],
+            source["citation_id"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(source)
+    return sources
+
+
+def _format_docs(documents: List[Document]) -> str:
+    return "\n\n".join(
+        f"[{document.metadata.get('citation_id', 'S?')}] {document.page_content}"
+        for document in documents
+    )
+
+
+_CITATION_TRANSLATION = str.maketrans(
+    {
+        "\u3010": "[",
+        "\u3011": "]",
+        "\uff3b": "[",
+        "\uff3d": "]",
+    }
+)
+
+
+def _normalize_citations(text: str) -> str:
+    return (text or "").translate(_CITATION_TRANSLATION)
+
+
+def _extract_citations(answer: str, documents: List[Document]) -> List[Dict[str, Any]]:
+    by_id = {
+        document.metadata.get("citation_id"): document
+        for document in documents
+        if document.metadata.get("citation_id")
+    }
+    cited: List[Dict[str, Any]] = []
+    seen = set()
+    for group in re.findall(r"\[([^\]]+)\]", _normalize_citations(answer)):
+        for match in re.finditer(r"S(\d+)", group):
+            citation_id = f"S{match.group(1)}"
+            if citation_id in seen or citation_id not in by_id:
+                continue
+            seen.add(citation_id)
+            cited.append(_document_source(by_id[citation_id]))
+    return cited
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text", "")))
+            else:
+                parts.append(str(part))
+        return "".join(parts)
+    return str(content)
+
+
+def _usage_from_response(response: Any, config: RAGConfig) -> Dict[str, Any]:
+    usage = getattr(response, "usage_metadata", None)
+    if not usage:
+        usage = (getattr(response, "response_metadata", None) or {}).get("token_usage") or {}
+    prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+    completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+    cost = (
+        prompt_tokens / 1_000_000 * config.input_cost_per_million
+        + completion_tokens / 1_000_000 * config.output_cost_per_million
+    )
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "estimated_cost_usd": round(cost, 6),
+    }
+
+
+def retrieve(state: State, config: RunnableConfig) -> Dict[str, Any]:
+    started = time.perf_counter()
+    question = state["question"]
+    rag_config = _get_config(config)
+    retriever = config.get("configurable", {}).get("retriever")
+
     if not retriever:
-        # You might need a default path or logic to load a store here
-        # For now, just logging a warning so it doesn't crash immediately
-        logger.warning("No retriever found in config! using fallback or empty results")
-        return {'documents': [], 'question': question}
-    documents = retriever.invoke(question)
+        logger.warning("No retriever found in config; returning empty results")
+        return {
+            "question": question,
+            "generated_queries": [question],
+            "retrieved_documents": [],
+            "documents": [],
+            "sources": [],
+            "timings": {"retrieve": _elapsed_ms(started)},
+        }
 
-    if not documents:
-        print("---WARNING: RETRIEVER FOUND 0 DOCUMENTS---")
+    queries = [question]
+    if rag_config.translation_mode != "none":
+        try:
+            translator = _query_translator(
+                rag_config.translator_model,
+                rag_config.n_query_variants,
+                rag_config.request_timeout,
+            )
+            variants = translator.translate(question, mode=rag_config.translation_mode)
+            queries = list(dict.fromkeys([question] + variants))
+        except Exception as error:
+            logger.warning("Query translation failed, falling back to original query: %s", error)
+
+    merged: List[Document] = []
+    if rag_config.parallel_retrieval and len(queries) > 1:
+        with ThreadPoolExecutor(max_workers=rag_config.max_workers) as executor:
+            futures = [executor.submit(retriever.invoke, query) for query in queries]
+            for query, future in zip(queries, futures):
+                try:
+                    merged.extend(future.result())
+                except Exception as error:
+                    logger.warning("Retrieval failed for query '%s': %s", query, error)
     else:
-        print(f"---RETRIEVED {len(documents)} DOCUMENTS---")
+        for query in queries:
+            try:
+                merged.extend(retriever.invoke(query))
+            except Exception as error:
+                logger.warning("Retrieval failed for query '%s': %s", query, error)
 
-  
+    merged = _deduplicate_documents(merged)
+    merged = _assign_citation_ids(merged)
+    return {
+        "question": question,
+        "generated_queries": queries,
+        "retrieved_documents": merged,
+        "documents": merged,
+        "sources": _extract_sources(merged),
+        "timings": {"retrieve": _elapsed_ms(started)},
+    }
 
-    return {'documents':documents, 'question':question}
 
-def generate(state: State):
-    question = state['question']
-    documents = state['documents']
-
-    generation = rag_chain.invoke({'question':question, 'context':documents})
-
-    return {'documents':documents, 'question':question, 'generation':generation}
-
-def grade_documents(state:State):
-    question = state['question']
-    documents = state['documents']
-    filteredDocs = []
-    web_search = False
+def grade_documents(state: State, config: RunnableConfig) -> Dict[str, Any]:
+    started = time.perf_counter()
+    question = state["question"]
+    documents = list(state.get("documents", []))
+    rag_config = _get_config(config)
+    web_search_enabled = state.get("web_search_enabled", rag_config.enable_web_search)
 
     broad_phrases = [
         "what is this paper about",
@@ -145,133 +436,253 @@ def grade_documents(state:State):
         "overview",
         "abstract",
         "give me a summary",
-        "introduction to"
+        "introduction to",
     ]
 
-    if any(p in question.lower() for p in broad_phrases):
-        return {'documents':documents, 'question':question, 'web_search':False}
-    
-    for doc in documents:
-        score = grader_chain.invoke({'question': question, 'document': doc.page_content})
-        grade = score.binary_score
+    if not documents:
+        return {
+            "documents": [],
+            "sources": [],
+            "question": question,
+            "web_search_used": bool(web_search_enabled),
+            "timings": {"grade_documents": _elapsed_ms(started)},
+        }
 
-        print(f"Doc snippet: {doc.page_content[:60]}...")
-        print(f"--> Grade: {grade}")
+    if any(phrase in question.lower() for phrase in broad_phrases):
+        documents = _assign_citation_ids(documents)
+        return {
+            "documents": documents,
+            "sources": _extract_sources(documents),
+            "question": question,
+            "web_search_used": False,
+            "timings": {"grade_documents": _elapsed_ms(started)},
+        }
 
-        if grade.lower() == 'yes':
-            filteredDocs.append(doc)
-        else:
-            web_search = True
+    filtered: List[Document] = []
+    if rag_config.grading_mode != "none":
+        limit = rag_config.max_grade_docs if rag_config.max_grade_docs > 0 else len(documents)
+        grader = _grader_chain(
+            rag_config.llm_model,
+            rag_config.temperature,
+            rag_config.request_timeout,
+        )
+        for document in documents[:limit]:
+            try:
+                score = grader.invoke({"question": question, "document": document.page_content})
+                grade = str(score.binary_score).strip().lower()
+            except Exception as error:
+                logger.warning("Grading failed, keeping document: %s", error)
+                filtered.append(document)
+                continue
+
+            if grade == "yes":
+                filtered.append(document)
+    else:
+        filtered = documents
+
+    filtered = _assign_citation_ids(filtered)
+    need_web = bool(web_search_enabled and not filtered)
+    return {
+        "documents": filtered,
+        "sources": _extract_sources(filtered),
+        "question": question,
+        "web_search_used": need_web,
+        "timings": {"grade_documents": _elapsed_ms(started)},
+    }
+
+
+def decide_to_generate(state: State) -> str:
+    if state.get("web_search_used"):
+        logger.info("---DECISION: TRANSFORM QUERY (web search fallback)---")
+        return "transform_query"
+    logger.info("---DECISION: GENERATE---")
+    return "generate"
+
+
+def transform_query(state: State, config: RunnableConfig) -> Dict[str, Any]:
+    started = time.perf_counter()
+    question = state["question"]
+    documents = state.get("documents", [])
+    rag_config = _get_config(config)
+
+    try:
+        rewriter = _rewriter_chain(
+            rag_config.llm_model,
+            rag_config.temperature,
+            rag_config.request_timeout,
+        )
+        better_question = rewriter.invoke({"question": question}).strip()
+    except Exception as error:
+        logger.warning("Query rewrite failed, keeping original: %s", error)
+        better_question = question
+
+    return {
+        "documents": documents,
+        "question": better_question,
+        "query_rewritten": True,
+        "timings": {"transform_query": _elapsed_ms(started)},
+    }
+
+
+def web_search(state: State, config: RunnableConfig) -> Dict[str, Any]:
+    started = time.perf_counter()
+    question = state["question"]
+    documents = list(state.get("documents", []))
+
+    tool = _web_search_tool()
+    if tool is None:
+        logger.error("Web search requested but TAVILY_API_KEY is not configured")
+        return {
+            "question": question,
+            "documents": documents,
+            "sources": _extract_sources(documents),
+            "web_search_used": False,
+            "timings": {"web_search": _elapsed_ms(started)},
+        }
+
+    try:
+        result = tool.search(query=question, max_results=5)
+        result_list = result.get("results", [])
+    except Exception as error:
+        logger.error("Web search failed: %s", error)
+        return {
+            "question": question,
+            "documents": documents,
+            "sources": _extract_sources(documents),
+            "web_search_used": False,
+            "timings": {"web_search": _elapsed_ms(started)},
+        }
+
+    web_documents: List[Document] = []
+    for item in result_list:
+        url = item.get("url", "")
+        content = item.get("content", "")
+        if not content:
             continue
-
-    return {"documents": filteredDocs, 'question': question, 'web_search': web_search}
-def transform_query(state: State):
-
-    question = state['question']
-    documents = state['documents']
-
-    better_question = question_rewriter.invoke({'question':question})
-
-    return {'documents':documents, 'question':better_question}
-
-def web_search(state: State):
-
-    question = state['question']
-    documents = state['documents']
-
-    if not web_search_tool:
-        logger.error('Web search attempted but tool is unavailable.')
-        return {'question': question, 'documents': documents}
-
-    result = web_search_tool.search(query=question)
-
-    resultList = result.get('results', [])
-
-    webContent = "\n\n".join(
-        [f"Source: {d.get('url')}\nContent: {d.get('content')}" for d in resultList]
-    )
-
-    if webContent:
-        web_results = Document(page_content=webContent)
-
-        documents.append(web_results)
-
-    return {'question':question, 'documents':documents}
-
-
-def decide_to_generate(state: State):
-
-    state['question']
-    web_search = state['web_search']
-    docs = state['documents']
-
-    if web_search == True:
-        logger.info(
-            f"---DECISION:  TRANSFORM QUERY---. Number of Docs: {len(docs)} relevant docs"
+        web_documents.append(
+            Document(
+                page_content=f"Source: {url}\nContent: {content}",
+                metadata={"source": url, "url": url},
+            )
         )
 
-        return 'transform_query'
-    
-    else:
-        logger.info("---DECISION: GENERATE---")
-        return 'generate'
+    combined = _deduplicate_documents(documents + web_documents)
+    combined = _assign_citation_ids(combined)
+    return {
+        "question": question,
+        "documents": combined,
+        "sources": _extract_sources(combined),
+        "web_search_used": True,
+        "timings": {"web_search": _elapsed_ms(started)},
+    }
 
 
-def graphBuilder():
+def generate(state: State, config: RunnableConfig) -> Dict[str, Any]:
+    started = time.perf_counter()
+    question = state["question"]
+    documents = _assign_citation_ids(list(state.get("documents", [])))
+    rag_config = _get_config(config)
+    sources = _extract_sources(documents)
 
+    if not documents:
+        generation = "I couldn't find any relevant information to answer your question."
+        return {
+            "generation": generation,
+            "sources": sources,
+            "citations": [],
+            "usage": {},
+            "timings": {"generate": _elapsed_ms(started)},
+        }
+
+    try:
+        messages = rag_prompt.format_messages(question=question, context=_format_docs(documents))
+        response = _llm(rag_config).invoke(messages)
+        generation = _normalize_citations(_message_text(response))
+        usage = _usage_from_response(response, rag_config)
+    except Exception as error:
+        logger.error("LLM generation failed: %s", error)
+        generation = (
+            "An error occurred while generating an answer. "
+            "Please ensure your API keys are configured."
+        )
+        usage = {}
+
+    citations = _extract_citations(generation, documents)
+    return {
+        "generation": generation,
+        "sources": sources,
+        "citations": citations,
+        "usage": usage,
+        "timings": {"generate": _elapsed_ms(started)},
+    }
+
+
+def graph_builder():
     workflow = StateGraph(state_schema=State)
 
-    workflow.add_node('retrieve', retrieve)
-    workflow.add_node('grade_documents', grade_documents)
-    workflow.add_node('generate', generate)
-    workflow.add_node('transform_query', transform_query)
-    workflow.add_node('web_search', web_search)
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("grade_documents", grade_documents)
+    workflow.add_node("transform_query", transform_query)
+    workflow.add_node("web_search", web_search)
+    workflow.add_node("generate", generate)
 
-    workflow.add_edge(START, 'retrieve')
-    workflow.add_edge('retrieve', 'grade_documents')
+    workflow.add_edge(START, "retrieve")
+    workflow.add_edge("retrieve", "grade_documents")
     workflow.add_conditional_edges(
-        'grade_documents',
+        "grade_documents",
         decide_to_generate,
-        {
-            'transform_query': 'transform_query',
-            'generate':'generate'
-        }
+        {"transform_query": "transform_query", "generate": "generate"},
     )
-    workflow.add_edge('transform_query', 'web_search')
-    workflow.add_edge('web_search', 'generate')
-    workflow.add_edge('generate', END)
-
+    workflow.add_edge("transform_query", "web_search")
+    workflow.add_edge("web_search", "generate")
+    workflow.add_edge("generate", END)
 
     return workflow.compile()
 
 
-app = graphBuilder()
+app = graph_builder()
 
 
-def chat(path, user_input:str):
+def run_rag_agent(
+    retriever,
+    question: str,
+    enable_web_search: Optional[bool] = None,
+    rag_config: Optional[RAGConfig] = None,
+) -> Dict[str, Any]:
+    config = rag_config or RAGConfig.from_env()
+    if enable_web_search is not None:
+        config = replace(config, enable_web_search=bool(enable_web_search))
+    inputs = {
+        "question": question,
+        "original_question": question,
+        "web_search_enabled": config.enable_web_search,
+    }
+    run_config = {"configurable": {"retriever": retriever, "rag_config": config}}
+    return app.invoke(inputs, config=run_config)
 
+
+def chat(
+    path: str,
+    user_input: str,
+    enable_web_search: Optional[bool] = None,
+    rag_config: Optional[RAGConfig] = None,
+) -> str:
     if not Path(path).exists():
-        logger.error('File path does not exist')
-        return 'Error: File path does not exist.'
+        logger.error("File path does not exist")
+        return "Error: File path does not exist."
 
+    config = rag_config or RAGConfig.from_env()
     chunks = loadingDocument(path)
+    result = Embedding(path, chunks).create_or_load_vectorstore(
+        userId="1",
+        documentId=Path(path).stem,
+        knn=config.top_k,
+    )
 
-    retriever= embedding(path,chunks)
-
-
-    inputs = {'question':user_input}
-
-    for output in app.stream(inputs, config={'configurable':{'retriever':retriever}}):
-        for key, value in output.items():
-            pprint(f"Node '{key}':")
-            final_value = value
-        pprint("\n---\n")
-
-    if final_value and isinstance(final_value, dict):
-        result = final_value.get('generation', '⚠️ No generation produced')
-        return result
-    else:
-        logger.error('No final state produced by the graph.')
-        return 'Error: No final state produced.'
-    
-
+    final_state = run_rag_agent(
+        result["retriever"],
+        user_input,
+        enable_web_search=enable_web_search,
+        rag_config=config,
+    )
+    return final_state.get("generation", "Error: No generation produced.")

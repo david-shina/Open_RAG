@@ -5,12 +5,27 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+.coverage.*
 
 # Virtual environments
-.venv
+.venv/
+venv/
 
 # Environment variables
 .env
 
 # Database
 db.sqlite3
+
+# Local runtime data
+media/
+chroma/
+chroma_*.db/
+.cache/
+benchmarks/.cache/
+RAG/
